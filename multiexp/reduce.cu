@@ -8,9 +8,11 @@
 
 // C is the size of the precomputation
 // R is the number of points we're handling per thread
-template< typename EC, int C = 4, int RR = 8 >
+template< typename EC, typename EC2, int C = 4, int RR = 8 >
 __global__ void
-ec_multiexp_straus(var *out, const var *multiples_, const var *scalars_, size_t N)
+ec_multiexp_straus(var *out, var *out1, var *out2, var *out3, 
+                    const var *multiples_, const var *multiples1_, const var *multiples2_, const var *multiples3_,
+                    const var *scalars_, size_t N)
 {
     int T = threadIdx.x, B = blockIdx.x, D = blockDim.x;
     int elts_per_block = D / BIG_WIDTH;
@@ -37,15 +39,21 @@ ec_multiexp_straus(var *out, const var *multiples_, const var *scalars_, size_t 
         }
 
         const var *multiples = multiples_ + m_off;
+        const var *multiples1 = multiples1_ + m_off;
+        const var *multiples2 = multiples2_ + m_off;
         // TODO: Consider loading multiples and/or scalars into shared memory
 
         // i is smallest multiple of C such that i > 753
-        int i = C * ((753 + C - 1) / C); // C * ceiling(753/C)
+        int CRound = C * ((753 + C - 1) / C); // C * ceiling(753/C)
+        int i = CRound;
         assert((i - C * 753) < C);
         static constexpr var C_MASK = (1U << C) - 1U;
 
+        int window[(C * ((753 + C - 1) / C))*RR + 1];
+
         EC x;
         EC::set_zero(x);
+        int k = 0;
         while (i >= C) {
             EC::mul_2exp<C>(x, x);
             i -= C;
@@ -63,15 +71,88 @@ ec_multiexp_straus(var *out, const var *multiples_, const var *scalars_, size_t 
                     s = g.shfl(scalars[j].a, q + 1);
                     win |= (s << bottom_bits) & C_MASK;
                 }
+                window[k*R+j] = win;
                 if (win > 0) {
                     EC m;
-                    //EC::add(x, x, multiples[win - 1][j]);
                     EC::load_affine(m, multiples + ((win-1)*N + j)*AFF_POINT_LIMBS);
                     EC::mixed_add(x, x, m);
                 }
             }
+            k ++;
         }
         EC::store_jac(out + out_off, x);
+
+        EC::set_zero(x);
+        k = 0;
+        i = CRound;
+        while (i >= C) {
+            EC::mul_2exp<C>(x, x);
+            i -= C;
+
+            for (int j = 0; j < R; ++j) {
+                int win = window[k*R+j];
+                if (win > 0) {
+                    EC m;
+                    EC::load_affine(m, multiples1 + ((win-1)*N + j)*AFF_POINT_LIMBS);
+                    EC::mixed_add(x, x, m);
+                }
+            }
+            k ++;
+        }
+        EC::store_jac(out1 + out_off, x);
+
+        //if (idx >= 2)
+        {
+            EC::set_zero(x);
+            k = 0;
+            i = CRound;
+            while (i >= C) {
+                EC::mul_2exp<C>(x, x);
+                i -= C;
+                int j = 0;
+                // TODO:
+                if (idx == 0) {
+                    j = 2;
+                }
+
+                for (; j < R; ++j) {
+                    int win = window[k*R+j];
+                    if (win > 0) {
+                        EC m;
+                        EC::load_affine(m, multiples2 + ((win-1)*(N-2) + j - 2)*AFF_POINT_LIMBS);
+                        EC::mixed_add(x, x, m);
+                    }
+                }
+                k ++;
+            }
+            EC::store_jac(out2 + out_off, x);
+        }
+
+        static constexpr int JAC_POINT_LIMBS_2 = 3 * EC2::field_type::DEGREE * ELT_LIMBS;
+        static constexpr int AFF_POINT_LIMBS_2 = 2 * EC2::field_type::DEGREE * ELT_LIMBS;
+        out_off = idx * JAC_POINT_LIMBS_2;
+        m_off = idx * RR * AFF_POINT_LIMBS_2;
+        const var *multiples3 = multiples3_ + m_off;
+
+        EC2 y;
+        EC2::set_zero(y);
+        k = 0;
+        i = CRound;
+        while (i >= C) {
+            EC2::mul_2exp<C>(y, y);
+            i -= C;
+
+            for (int j = 0; j < R; ++j) {
+                int win = window[k*R+j];
+                if (win > 0) {
+                    EC2 m;
+                    EC2::load_affine(m, multiples3 + ((win-1)*N + j)*AFF_POINT_LIMBS_2);
+                    EC2::mixed_add(y, y, m);
+                }
+            }
+            k ++;
+        }
+        EC2::store_jac(out3 + out_off, y);
     }
 }
 
@@ -126,28 +207,54 @@ ec_sum_all(var *X, const var *Y, size_t n)
     }
 }
 
-static constexpr size_t threads_per_block = 256;
-
-template< typename EC, int C, int R >
+static constexpr size_t threads_per_block = 512;
+template< typename EC, typename EC2, int C, int R >
 void
-ec_reduce_straus(cudaStream_t &strm, var *out, const var *multiples, const var *scalars, size_t N)
+ec_reduce_straus(var *out, var *out1, var *out2, var *out3,
+                    const var *multiples, const var *multiples1, const var *multiples2, const var *multiples3,
+                    const var *scalars, size_t N)
 {
-    cudaStreamCreate(&strm);
-
     static constexpr size_t pt_limbs = EC::NELTS * ELT_LIMBS;
+    static constexpr size_t pt2_limbs = EC2::NELTS * ELT_LIMBS;
     size_t n = (N + R - 1) / R;
 
     size_t nblocks = (n * BIG_WIDTH + threads_per_block - 1) / threads_per_block;
+    printf("nblocks %d\n", nblocks);
 
-    ec_multiexp_straus<EC, C, R><<< nblocks, threads_per_block, 0, strm>>>(out, multiples, scalars, N);
+    ec_multiexp_straus<EC, EC2, C, R><<< nblocks, threads_per_block>>>(out, out1, out2, out3, multiples, multiples1, multiples2, multiples3, scalars, N);
 
     size_t r = n & 1, m = n / 2;
     for ( ; m != 0; r = m & 1, m >>= 1) {
         nblocks = (m * BIG_WIDTH + threads_per_block - 1) / threads_per_block;
 
-        ec_sum_all<EC><<<nblocks, threads_per_block, 0, strm>>>(out, out + m*pt_limbs, m);
+        ec_sum_all<EC><<<nblocks, threads_per_block>>>(out, out + m*pt_limbs, m);
         if (r)
-            ec_sum_all<EC><<<1, threads_per_block, 0, strm>>>(out, out + 2*m*pt_limbs, 1);
+            ec_sum_all<EC><<<1, threads_per_block>>>(out, out + 2*m*pt_limbs, 1);
+    }
+    r = n & 1, m = n / 2;
+    for ( ; m != 0; r = m & 1, m >>= 1) {
+        nblocks = (m * BIG_WIDTH + threads_per_block - 1) / threads_per_block;
+
+        ec_sum_all<EC><<<nblocks, threads_per_block>>>(out1, out1 + m*pt_limbs, m);
+        if (r)
+            ec_sum_all<EC><<<1, threads_per_block>>>(out1, out1 + 2*m*pt_limbs, 1);
+    }
+    r = n & 1, m = n / 2;
+    for ( ; m != 0; r = m & 1, m >>= 1) {
+        nblocks = (m * BIG_WIDTH + threads_per_block - 1) / threads_per_block;
+
+        ec_sum_all<EC2><<<nblocks, threads_per_block>>>(out3, out3 + m*pt2_limbs, m);
+        if (r)
+            ec_sum_all<EC2><<<1, threads_per_block>>>(out3, out3 + 2*m*pt2_limbs, 1);
+    }
+    //n = (N - 2 + R - 1) / R;
+    r = n & 1, m = n / 2;
+    for ( ; m != 0; r = m & 1, m >>= 1) {
+        nblocks = (m * BIG_WIDTH + threads_per_block - 1) / threads_per_block;
+
+        ec_sum_all<EC><<<nblocks, threads_per_block>>>(out2, out2 + m*pt_limbs, m);
+        if (r)
+            ec_sum_all<EC><<<1, threads_per_block>>>(out2, out2 + 2*m*pt_limbs, 1);
     }
 }
 
